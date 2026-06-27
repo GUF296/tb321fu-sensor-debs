@@ -1,0 +1,81 @@
+name: Build TB321FU Sensor Debs
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create/upload. Empty disables release upload.
+        required: false
+        default: tb321fu-sensor-debs-20260626.1
+        type: string
+      sensor_deb_version:
+        description: Debian package version
+        required: true
+        default: 20260626.1
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates git curl tar xz-utils zstd unzip rsync \
+            meson ninja-build pkg-config protobuf-c-compiler \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dpkg-dev \
+            libglib2.0-dev libqmi-glib-dev libgudev-1.0-dev libpolkit-gobject-1-dev libprotobuf-c-dev
+
+      - name: Build sensor debs
+        run: |
+          set -euo pipefail
+          env \
+            OUTPUT_DIR=out/tb321fu-sensor-debs \
+            ARCH=arm64 \
+            SENSOR_DEB_VERSION='${{ inputs.sensor_deb_version }}' \
+            SENSOR_STRIP=1 \
+            bash scripts/ci/build-tb321fu-sensor-debs-from-upstreams.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tb321fu-sensor-debs-${{ inputs.sensor_deb_version }}-arm64
+          path: out/tb321fu-sensor-debs/*
+
+      - name: Upload release assets
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          notes=out/tb321fu-sensor-debs/RELEASE-NOTES.md
+          {
+            echo '# TB321FU Sensor Debs'
+            echo
+            echo "- Package version: ${{ inputs.sensor_deb_version }}"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Workflow run: $GITHUB_RUN_ID"
+            echo
+            echo 'Built from fixed upstream-derived branches:'
+            echo '- libssc: GUF296/libssc tb321fu-qcom-sns-20260626.1'
+            echo '- iio-sensor-proxy: GUF296/iio-sensor-proxy tb321fu-qcom-sns-20260626.1'
+            echo '- hexagonrpc: GUF296/hexagonrpc tb321fu-qcom-sns-20260626.1'
+          } > "$notes"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes"
+          fi
+          gh release upload "$RELEASE_TAG" \
+            out/tb321fu-sensor-debs/tb321fu-sensor-debs_${{ inputs.sensor_deb_version }}_arm64.tar.gz \
+            out/tb321fu-sensor-debs/SHA256SUMS-archive.txt \
+            --clobber
