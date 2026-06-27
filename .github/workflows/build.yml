@@ -6,12 +6,12 @@ on:
       release_tag:
         description: Release tag to create/upload. Empty disables release upload.
         required: false
-        default: tb321fu-sensor-debs-20260626.1
+        default: tb321fu-sensor-debs-20260627.1
         type: string
       sensor_deb_version:
         description: Debian package version
         required: true
-        default: 20260626.1
+        default: 20260627.1
         type: string
 
 jobs:
