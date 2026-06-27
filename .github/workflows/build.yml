@@ -32,7 +32,7 @@ jobs:
             ca-certificates git curl tar xz-utils zstd unzip rsync \
             meson ninja-build pkg-config protobuf-compiler protobuf-c-compiler libxml2-utils \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dpkg-dev \
-            libglib2.0-dev libqmi-glib-dev libgudev-1.0-dev libsystemd-dev libpolkit-gobject-1-dev libprotobuf-c-dev
+            libglib2.0-dev libmbim-glib-dev libqmi-glib-dev libgudev-1.0-dev libsystemd-dev libpolkit-gobject-1-dev libprotobuf-c-dev
 
       - name: Build sensor debs
         run: |
