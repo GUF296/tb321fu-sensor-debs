@@ -6,13 +6,22 @@ on:
       release_tag:
         description: Release tag to create/upload. Empty disables release upload.
         required: false
-        default: tb321fu-sensor-debs-20260627.1
+        default: ""
         type: string
+      prerelease:
+        description: Publish a non-empty release tag as a prerelease without changing latest.
+        required: true
+        default: true
+        type: boolean
       sensor_deb_version:
         description: Debian package version
         required: true
-        default: 20260627.1
+        default: 20260715.1
         type: string
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.release_tag != '' && inputs.release_tag || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -22,7 +31,19 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow and lifecycle boundaries
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/check-workflow-input-boundaries.py --self-test
+          python3 scripts/ci/check-workflow-input-boundaries.py .github/workflows/build.yml
+          python3 scripts/ci/check-action-pins.py --self-test
+          python3 scripts/ci/check-action-pins.py .github/workflows/build.yml
+          bash scripts/ci/test-qcom-sns-lifecycle.sh
+          bash scripts/ci/test-release-publication.sh
 
       - name: Install dependencies
         run: |
@@ -30,22 +51,56 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             ca-certificates git curl tar xz-utils zstd unzip rsync \
+            patch util-linux \
             meson ninja-build pkg-config protobuf-compiler protobuf-c-compiler libxml2-utils \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu dpkg-dev \
             libglib2.0-dev libmbim-glib-dev libqmi-glib-dev libgudev-1.0-dev libsystemd-dev libpolkit-gobject-1-dev libprotobuf-c-dev
 
+      - name: Validate build inputs
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease && '1' || '0' }}
+          INPUT_SENSOR_DEB_VERSION: ${{ inputs.sensor_deb_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_RELEASE_TAG" ] && [ "$INPUT_PRERELEASE" != 1 ]; then
+            echo 'Remediation releases must set prerelease=true.' >&2
+            exit 1
+          fi
+          [[ "$INPUT_SENSOR_DEB_VERSION" =~ ^[0-9][0-9A-Za-z.+~_-]{0,63}$ ]] || {
+            echo 'unsafe sensor_deb_version' >&2
+            exit 1
+          }
+          dpkg --validate-version "$INPUT_SENSOR_DEB_VERSION"
+          printf 'SENSOR_DEB_VERSION=%s\n' "$INPUT_SENSOR_DEB_VERSION" >> "$GITHUB_ENV"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
       - name: Build sensor debs
         run: |
           set -euo pipefail
+          output=out/tb321fu-sensor-debs
+          repro=out/tb321fu-sensor-debs-repro
           env \
-            OUTPUT_DIR=out/tb321fu-sensor-debs \
+            OUTPUT_DIR="$output" \
             ARCH=arm64 \
-            SENSOR_DEB_VERSION='${{ inputs.sensor_deb_version }}' \
+            SENSOR_DEB_VERSION="$SENSOR_DEB_VERSION" \
+            SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
             SENSOR_STRIP=1 \
             bash scripts/ci/build-tb321fu-sensor-debs-from-upstreams.sh
+          env \
+            OUTPUT_DIR="$repro" \
+            ARCH=arm64 \
+            SENSOR_DEB_VERSION="$SENSOR_DEB_VERSION" \
+            SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            SENSOR_STRIP=1 \
+            bash scripts/ci/build-tb321fu-sensor-debs-from-upstreams.sh
+          diff -qr --no-dereference "$output" "$repro"
+          echo 'SENSOR_REPRODUCIBILITY=PASS'
+          . scripts/ci/common.sh
+          ci_safe_rmtree "$repro" "$PWD/out" tb321fu-sensor-debs-repro
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tb321fu-sensor-debs-${{ inputs.sensor_deb_version }}-arm64
           path: out/tb321fu-sensor-debs/*
@@ -55,27 +110,32 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          PRERELEASE: ${{ inputs.prerelease && '1' || '0' }}
         run: |
           set -euo pipefail
           notes=out/tb321fu-sensor-debs/RELEASE-NOTES.md
           {
             echo '# TB321FU Sensor Debs'
             echo
-            echo "- Package version: ${{ inputs.sensor_deb_version }}"
+            echo "- Package version: $SENSOR_DEB_VERSION"
             echo "- Commit: $GITHUB_SHA"
             echo "- Workflow run: $GITHUB_RUN_ID"
             echo
-            echo 'Built from fixed upstream-derived branches:'
-            echo '- libssc: GUF296/libssc tb321fu-qcom-sns-20260626.1'
-            echo '- iio-sensor-proxy: GUF296/iio-sensor-proxy tb321fu-qcom-sns-20260626.1'
-            echo '- hexagonrpc: GUF296/hexagonrpc tb321fu-qcom-sns-20260626.1'
+            echo 'Built from the full commits recorded in SOURCE-LOCK.tsv.'
+            echo 'Static CI verifies package/lifecycle behavior; ADSP SSR and suspend/resume remain device gates.'
           } > "$notes"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes"
-          else
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes"
-          fi
-          gh release upload "$RELEASE_TAG" \
-            out/tb321fu-sensor-debs/tb321fu-sensor-debs_${{ inputs.sensor_deb_version }}_arm64.tar.gz \
-            out/tb321fu-sensor-debs/SHA256SUMS-archive.txt \
-            --clobber
+          release_dir=out/tb321fu-sensor-release/assets
+          mkdir -p "$release_dir"
+          install -m 0644 \
+            "out/tb321fu-sensor-debs/tb321fu-sensor-debs_${SENSOR_DEB_VERSION}_arm64.tar.gz" \
+            out/tb321fu-sensor-debs/SOURCE-LOCK.tsv \
+            out/tb321fu-sensor-debs/DEVICE-DATA.sha256 \
+            "$release_dir/"
+          (
+            cd "$release_dir"
+            sha256sum -- \
+              "tb321fu-sensor-debs_${SENSOR_DEB_VERSION}_arm64.tar.gz" \
+              SOURCE-LOCK.tsv \
+              DEVICE-DATA.sha256 > SHA256SUMS.txt
+          )
+          bash scripts/ci/publish-release.sh "$RELEASE_TAG" "$release_dir" "$notes"
