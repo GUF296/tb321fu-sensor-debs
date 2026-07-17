@@ -18,7 +18,11 @@ SOURCE_MANIFESTS="$ROOT/.tb321fu-manifests"
 LOG="$LOGDIR/hexagonrpcd-init.log"
 LOCK="$STATE/init.lock"
 slot_root=
-committed=0
+candidate_disposable=0
+published=0
+legacy=
+new_link=
+ready_link=
 tmp_log=
 
 fail() {
@@ -39,8 +43,26 @@ safe_absolute_path() {
 }
 
 cleanup() {
+  local active=
   [ -z "$tmp_log" ] || rm -f -- "$tmp_log"
-  if [ "$committed" -ne 1 ] && [ -n "$slot_root" ]; then
+  [ -z "$new_link" ] || rm -f -- "$new_link"
+  [ -z "$ready_link" ] || rm -f -- "$ready_link"
+  if [ -n "$legacy" ] && [ -e "$legacy" ]; then
+    if [ -L "$REGISTRY" ]; then
+      active=$(readlink -f -- "$REGISTRY" 2>/dev/null || :)
+    fi
+    if [ -n "$slot_root" ] && [ "$active" = "$slot_root/registry" ]; then
+      published=1
+      rm -rf -- "$legacy"
+      legacy=
+    elif [ ! -e "$REGISTRY" ] && [ ! -L "$REGISTRY" ]; then
+      if mv -T -- "$legacy" "$REGISTRY"; then
+        legacy=
+      fi
+    fi
+  fi
+  if [ "$candidate_disposable" -eq 1 ] && [ "$published" -ne 1 ] &&
+    [ -n "$slot_root" ]; then
     case $slot_root in
       "$GENERATIONS/slot-a"|"$GENERATIONS/slot-b") rm -rf -- "$slot_root" ;;
     esac
@@ -97,11 +119,29 @@ done
 current=
 slot=slot-a
 if [ -L "$REGISTRY" ]; then
-  current=$(readlink -f -- "$REGISTRY") || fail "broken qcom-sns registry generation link"
-  case $current in
-    "$GENERATIONS/slot-a/registry") slot=slot-b ;;
-    "$GENERATIONS/slot-b/registry") slot=slot-a ;;
-    *) fail "qcom-sns registry generation escapes managed slots: $current" ;;
+  registry_target=$(readlink -- "$REGISTRY") || fail "cannot read qcom-sns registry link"
+  case $registry_target in
+    ../../../generations/slot-a/registry|"$GENERATIONS/slot-a/registry")
+      current="$GENERATIONS/slot-a/registry"
+      if [ -d "$current" ]; then
+        slot=slot-b
+      else
+        rm -f -- "$REGISTRY"
+        current=
+        slot=slot-a
+      fi
+      ;;
+    ../../../generations/slot-b/registry|"$GENERATIONS/slot-b/registry")
+      current="$GENERATIONS/slot-b/registry"
+      if [ -d "$current" ]; then
+        slot=slot-a
+      else
+        rm -f -- "$REGISTRY"
+        current=
+        slot=slot-b
+      fi
+      ;;
+    *) fail "qcom-sns registry generation link is unmanaged: $registry_target" ;;
   esac
 elif [ -d "$REGISTRY" ]; then
   current=$REGISTRY
@@ -116,6 +156,7 @@ case $slot_root in
 esac
 rm -rf -- "$slot_root"
 mkdir -p "$slot_root/registry"
+candidate_disposable=1
 
 if [ -n "$current" ]; then
   if find -H "$current" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
@@ -203,19 +244,28 @@ else
   mv -Tf -- "$ready_link" "$STATE/current.ready"
 fi
 
+candidate_disposable=0
 if [ -L "$REGISTRY" ] || [ ! -e "$REGISTRY" ]; then
-  mv -Tf -- "$new_link" "$REGISTRY"
+  if mv -Tf -- "$new_link" "$REGISTRY"; then
+    published=1
+  else
+    candidate_disposable=1
+    fail "failed to publish qcom-sns generation"
+  fi
 else
   legacy="$STATE/.legacy-registry.$$"
   mv -T -- "$REGISTRY" "$legacy"
   if mv -Tf -- "$new_link" "$REGISTRY"; then
+    published=1
     rm -rf -- "$legacy"
+    legacy=
   else
-    mv -T -- "$legacy" "$REGISTRY"
+    mv -T -- "$legacy" "$REGISTRY" || fail "failed to restore legacy qcom-sns registry"
+    legacy=
+    candidate_disposable=1
     fail "failed to publish qcom-sns generation"
   fi
 fi
-committed=1
 cat "$tmp_log" >>"$LOG"
 printf 'committed generation=%s registry_files=%s rc=%s\n' "$slot" "$count" "$rc" >>"$LOG"
 exit 0

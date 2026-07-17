@@ -57,7 +57,31 @@ esac
 EOF_MOCK
 chmod 0755 "$mock"
 
+shim_bin="$tmp/bin"
+mkdir -p "$shim_bin"
+cat >"$shim_bin/mv" <<'EOF_MV_SHIM'
+#!/bin/sh
+set -eu
+last=
+for argument do
+  last=$argument
+done
+/usr/bin/mv "$@"
+case ${MV_SIGNAL_MODE:-} in
+  registry)
+    [ "$last" != "${MV_SIGNAL_DESTINATION:-}" ] || kill -TERM "$PPID"
+    ;;
+  legacy)
+    case $last in
+      "${MV_SIGNAL_LEGACY_PREFIX:-}"*) kill -TERM "$PPID" ;;
+    esac
+    ;;
+esac
+EOF_MV_SHIM
+chmod 0755 "$shim_bin/mv"
+
 run_init() {
+  PATH="$shim_bin:/usr/bin:/bin" \
   QCOM_SNS_HEXAGONRPCD="$mock" \
   QCOM_SNS_DEVICE_ROOT="$root" \
   QCOM_SNS_STATE_ROOT="$state" \
@@ -65,6 +89,9 @@ run_init() {
   QCOM_SNS_LOG_DIR="$logs" \
   QCOM_SNS_INIT_TIMEOUT="${TEST_TIMEOUT:-2}" \
   QCOM_SNS_MIN_REGISTRY_FILES=3 \
+  MV_SIGNAL_MODE="${MV_SIGNAL_MODE:-}" \
+  MV_SIGNAL_DESTINATION="$registry" \
+  MV_SIGNAL_LEGACY_PREFIX="$state/.legacy-registry." \
   MOCK_MODE="${MOCK_MODE:-success}" \
     "$init"
 }
@@ -113,6 +140,19 @@ second_target=$(readlink "$registry")
 [ -s "$state/current.ready" ]
 (cd "$(dirname "$(readlink -f "$registry")")" && sha256sum -c manifest.sha256 >/dev/null)
 
+# A stop/SSR signal delivered immediately after the atomic registry rename must
+# never make cleanup delete the generation that just became visible.
+if MV_SIGNAL_MODE=registry run_init; then
+  echo 'post-publication TERM unexpectedly reported success' >&2
+  exit 1
+fi
+[ -L "$registry" ]
+signalled_target=$(readlink -f "$registry")
+[ -d "$signalled_target" ]
+[ -f "$registry/calibration" ]
+run_init
+[ -d "$(readlink -f "$registry")" ]
+
 # A listener that remains healthy until the bounded timeout is also accepted.
 MOCK_MODE=timeout TEST_TIMEOUT=1 run_init
 [ -f "$registry/generated-2" ]
@@ -126,6 +166,39 @@ if run_init; then
   exit 1
 fi
 [ "$(readlink "$registry")" = "$accepted_target" ]
+printf 'config\n' >"$root/sensors/config/device.conf"
+
+# A signal between moving a legacy directory aside and publishing the managed
+# symlink must restore the legacy directory. A later run then migrates it.
+rm -rf -- "$state"
+mkdir -p "$registry"
+printf 'legacy-after-signal\n' >"$registry/legacy-after-signal"
+if MV_SIGNAL_MODE=legacy run_init; then
+  echo 'legacy pre-publication TERM unexpectedly reported success' >&2
+  exit 1
+fi
+[ -d "$registry" ] && [ ! -L "$registry" ]
+[ -f "$registry/legacy-after-signal" ]
+run_init
+[ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
+
+# A broken link is recoverable only when its literal target is one of the two
+# managed slots; arbitrary symlink targets remain fatal.
+rm -rf -- "$state"
+mkdir -p "$state/persist/sensors/registry" "$state/generations"
+ln -s ../../../generations/slot-a/registry "$registry"
+run_init
+[ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
+
+rm -f -- "$registry"
+ln -s /tmp/unmanaged-qcom-sns-registry "$registry"
+if run_init; then
+  echo 'unmanaged qcom-sns registry symlink unexpectedly passed' >&2
+  exit 1
+fi
+rm -f -- "$registry"
+run_init
+[ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
 
 [ "$(find "$state/generations" -mindepth 1 -maxdepth 1 -type d | wc -l)" -le 2 ]
 [ ! -e "$state/.legacy-registry.$$" ]
