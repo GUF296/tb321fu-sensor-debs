@@ -143,7 +143,7 @@ done
 orphan_legacy=
 orphan_count=0
 for orphan in "$STATE"/.legacy-registry.*; do
-  [ -e "$orphan" ] || continue
+  [ -e "$orphan" ] || [ -L "$orphan" ] || continue
   [ -d "$orphan" ] && [ ! -L "$orphan" ] ||
     fail "qcom-sns legacy orphan is not a directory: $orphan"
   orphan_count=$((orphan_count + 1))
@@ -189,8 +189,7 @@ elif [ -e "$REGISTRY" ]; then
 fi
 if [ -n "$orphan_legacy" ]; then
   if [ -n "$current" ] && [ -L "$REGISTRY" ]; then
-    rm -rf -- "$orphan_legacy"
-    orphan_legacy=
+    : # Defer orphan disposal until the active generation manifest is valid.
   elif [ ! -e "$REGISTRY" ] && [ ! -L "$REGISTRY" ]; then
     mv -T -- "$orphan_legacy" "$REGISTRY"
     orphan_legacy=
@@ -215,10 +214,22 @@ if [ -n "$current" ]; then
     fail "existing qcom-sns registry contains unsupported members"
   fi
   if [ "$current" = "$REGISTRY" ]; then
+    [ -z "$orphan_legacy" ] ||
+      fail "qcom-sns legacy orphan conflicts with the active registry"
     cp -a -- "$current/." "$slot_root/registry/"
   else
     current_slot=${current%/registry}
     if (cd "$current_slot" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
+      if [ -n "$orphan_legacy" ]; then
+        rm -rf -- "$orphan_legacy"
+        orphan_legacy=
+      fi
+      cp -a -- "$current/." "$slot_root/registry/"
+    elif [ -n "$orphan_legacy" ]; then
+      rm -f -- "$REGISTRY"
+      mv -T -- "$orphan_legacy" "$REGISTRY"
+      orphan_legacy=
+      current=$REGISTRY
       cp -a -- "$current/." "$slot_root/registry/"
     else
       printf 'discarding invalid previous qcom-sns generation %s\n' "$current" >>"$LOG"

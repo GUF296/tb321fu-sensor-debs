@@ -52,6 +52,9 @@ case ${MOCK_MODE:-success} in
     echo QCOM_SNS_REGISTRY_ACCESS >&2
     sleep 5
     ;;
+  flood)
+    dd if=/dev/zero bs=65536 count=64 2>/dev/null
+    ;;
   *) exit 9 ;;
 esac
 EOF_MOCK
@@ -204,6 +207,13 @@ truncate -s 2097152 "$logs/hexagonrpcd-init.log"
 run_init
 [ "$(stat -c '%s' "$logs/hexagonrpcd-init.log")" -lt 600000 ]
 [ "$(stat -c '%a' "$logs/hexagonrpcd-init.log")" = 640 ]
+flood_target=$(readlink "$registry")
+if MOCK_MODE=flood run_init; then
+  echo 'unbounded hexagonrpcd output unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(readlink "$registry")" = "$flood_target" ]
+[ "$(stat -c '%s' "$logs/hexagonrpcd-init.log")" -lt 600000 ]
 
 # A broken link is recoverable only when its literal target is one of the two
 # managed slots; arbitrary symlink targets remain fatal.
@@ -233,6 +243,29 @@ mv -T -- "$registry" "$state/.legacy-registry.4242"
 run_init
 [ -L "$registry" ] && [ -f "$registry/orphaned-calibration" ]
 [ -z "$(find "$state" -maxdepth 1 -name '.legacy-registry.*' -print -quit)" ]
+
+# If an active managed slot exists but its manifest is incomplete after power
+# loss, the unique legacy orphan must win instead of being deleted early.
+rm -rf -- "$state"
+mkdir -p \
+  "$state/generations/slot-a/registry" \
+  "$state/persist/sensors/registry" \
+  "$state/.legacy-registry.4343"
+printf 'incomplete-active\n' >"$state/generations/slot-a/registry/incomplete"
+printf 'recoverable-calibration\n' > \
+  "$state/.legacy-registry.4343/recoverable-calibration"
+ln -s ../../../generations/slot-a/registry "$registry"
+run_init
+[ -L "$registry" ] && [ -f "$registry/recoverable-calibration" ]
+[ -z "$(find "$state" -maxdepth 1 -name '.legacy-registry.*' -print -quit)" ]
+
+rm -rf -- "$state"
+mkdir -p "$state"
+ln -s /tmp "$state/.legacy-registry.4444"
+if run_init; then
+  echo 'symlinked legacy orphan unexpectedly passed' >&2
+  exit 1
+fi
 
 rm -rf -- "$state"
 mkdir -p "$state/.legacy-registry.1" "$state/.legacy-registry.2"
