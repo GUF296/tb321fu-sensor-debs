@@ -182,6 +182,29 @@ fi
 run_init
 [ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
 
+# The legacy branch has a second signal window after publishing the managed
+# symlink but before the parent shell records publication. Cleanup must detect
+# the visible target, preserve it and remove the moved legacy backup.
+rm -rf -- "$state"
+mkdir -p "$registry"
+printf 'legacy-published-before-term\n' >"$registry/legacy-published-before-term"
+if MV_SIGNAL_MODE=registry run_init; then
+  echo 'legacy post-publication TERM unexpectedly reported success' >&2
+  exit 1
+fi
+[ -L "$registry" ]
+[ -d "$(readlink -f "$registry")" ]
+[ -f "$registry/legacy-published-before-term" ]
+[ -z "$(find "$state" -maxdepth 1 -name '.legacy-registry.*' -print -quit)" ]
+run_init
+[ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
+
+# Repeated SSR/resume must not grow the private diagnostic log without bound.
+truncate -s 2097152 "$logs/hexagonrpcd-init.log"
+run_init
+[ "$(stat -c '%s' "$logs/hexagonrpcd-init.log")" -lt 600000 ]
+[ "$(stat -c '%a' "$logs/hexagonrpcd-init.log")" = 640 ]
+
 # A broken link is recoverable only when its literal target is one of the two
 # managed slots; arbitrary symlink targets remain fatal.
 rm -rf -- "$state"
@@ -200,8 +223,29 @@ rm -f -- "$registry"
 run_init
 [ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
 
+# A power loss after moving the legacy directory can leave the process-PID
+# backup behind. Exactly one regular orphan is recovered; ambiguous state is
+# rejected instead of silently choosing calibration data.
+rm -rf -- "$state"
+mkdir -p "$registry"
+printf 'orphaned-calibration\n' >"$registry/orphaned-calibration"
+mv -T -- "$registry" "$state/.legacy-registry.4242"
+run_init
+[ -L "$registry" ] && [ -f "$registry/orphaned-calibration" ]
+[ -z "$(find "$state" -maxdepth 1 -name '.legacy-registry.*' -print -quit)" ]
+
+rm -rf -- "$state"
+mkdir -p "$state/.legacy-registry.1" "$state/.legacy-registry.2"
+if run_init; then
+  echo 'multiple legacy orphans unexpectedly passed' >&2
+  exit 1
+fi
+rm -rf -- "$state"
+run_init
+[ -L "$registry" ] && [ -d "$(readlink -f "$registry")" ]
+
 [ "$(find "$state/generations" -mindepth 1 -maxdepth 1 -type d | wc -l)" -le 2 ]
-[ ! -e "$state/.legacy-registry.$$" ]
+[ -z "$(find "$state" -maxdepth 1 -name '.legacy-registry.*' -print -quit)" ]
 
 grep -Fq 'BindsTo=dev-fastrpc\x2dadsp.device' "$service"
 grep -Fq 'PartOf=qrtr-ns.service' "$service"

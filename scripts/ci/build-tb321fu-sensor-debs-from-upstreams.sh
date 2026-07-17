@@ -34,26 +34,61 @@ work_dir=$(mktemp -d "${TMPDIR:-/tmp}/tb321fu-sensor-upstreams.XXXXXX")
 cleanup() { ci_safe_rmtree "$work_dir" "${TMPDIR:-/tmp}" tb321fu-sensor-upstreams.; }
 trap cleanup EXIT
 
+git_clean() {
+  env \
+    -u GIT_DIR \
+    -u GIT_WORK_TREE \
+    -u GIT_INDEX_FILE \
+    -u GIT_OBJECT_DIRECTORY \
+    -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_NAMESPACE \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_COUNT=0 \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    git "$@"
+}
+
+require_clean_producer_checkout() {
+  local revision hidden_flags
+
+  revision=$(git_clean -C "$REPO_ROOT" rev-parse HEAD)
+  [[ $revision =~ ^[0-9a-f]{40}$ ]] || ci_die "invalid sensor producer HEAD"
+  git_clean -C "$REPO_ROOT" diff-index --quiet HEAD -- ||
+    ci_die "dirty tracked sensor producer checkout"
+  [ -z "$(git_clean -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ] ||
+    ci_die "dirty or untracked sensor producer checkout"
+  [ -z "$(git_clean -C "$REPO_ROOT" ls-files -u)" ] ||
+    ci_die "sensor producer checkout has unmerged index entries"
+  hidden_flags=$(git_clean -C "$REPO_ROOT" ls-files -v | awk '$1 ~ /^[a-zS]$/')
+  [ -z "$hidden_flags" ] ||
+    ci_die "sensor producer checkout uses assume-unchanged or skip-worktree flags"
+  [ -z "$(git_clean -C "$REPO_ROOT" replace -l)" ] ||
+    ci_die "sensor producer checkout has Git replacement refs"
+  printf '%s\n' "$revision"
+}
+
 clone_locked() {
   local repo=$1
   local revision=$2
   local dst=$3
 
-  git init -q "$dst"
-  git -C "$dst" remote add origin "$repo"
-  git -C "$dst" fetch -q --depth=1 origin "$revision"
-  git -C "$dst" checkout -q --detach FETCH_HEAD
-  [ "$(git -C "$dst" rev-parse HEAD)" = "$revision" ] || \
+  git_clean init -q "$dst"
+  git_clean -C "$dst" remote add origin "$repo"
+  git_clean -C "$dst" fetch -q --depth=1 origin "$revision"
+  git_clean -C "$dst" checkout -q --detach FETCH_HEAD
+  [ "$(git_clean -C "$dst" rev-parse HEAD)" = "$revision" ] || \
     ci_die "upstream commit mismatch for $repo"
-  git -C "$dst" diff-index --quiet HEAD -- || \
+  git_clean -C "$dst" diff-index --quiet HEAD -- || \
     ci_die "dirty upstream checkout for $repo"
-  [ -z "$(git -C "$dst" status --porcelain --untracked-files=all)" ] || \
+  [ -z "$(git_clean -C "$dst" status --porcelain --untracked-files=all)" ] || \
     ci_die "untracked upstream files for $repo"
 }
 
 [ -d "$SENSOR_DEVICE_DATA_DIR/sensors/registry" ] || ci_die "missing sensor registry data: $SENSOR_DEVICE_DATA_DIR"
 [ -d "$SENSOR_DEVICE_DATA_DIR/sensors/config" ] || ci_die "missing sensor config data: $SENSOR_DEVICE_DATA_DIR"
 [ -d "$SENSOR_DEVICE_DATA_DIR/socinfo" ] || ci_die "missing sensor socinfo data: $SENSOR_DEVICE_DATA_DIR"
+producer_revision_before=$(require_clean_producer_checkout)
 
 source_root="$work_dir/source-root"
 baseline_root="$work_dir/baseline-root"
@@ -95,14 +130,10 @@ rm -f -- "$archive_dir/$archive_name" \
   sha256sum -c "$archive_dir/DEVICE-DATA.sha256" >/dev/null) || \
   ci_die "device-data manifest self-check failed"
 
-producer_revision=$(git -C "$REPO_ROOT" rev-parse HEAD)
+producer_revision=$(require_clean_producer_checkout)
+[ "$producer_revision" = "$producer_revision_before" ] ||
+  ci_die "sensor producer HEAD changed during the build"
 producer_state=clean
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]; then
-  producer_state=dirty
-fi
-if [ "${CI:-}" = true ] && [ "$producer_state" != clean ]; then
-  ci_die "CI sensor producer checkout is dirty"
-fi
 {
   printf 'component\trepository\tcommit\n'
   printf 'sensor-producer\t%s\t%s\n' \
